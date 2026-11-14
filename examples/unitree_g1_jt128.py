@@ -32,6 +32,8 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, Imu
 from nav_msgs.msg import Odometry
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import TransformBroadcaster
 
 from mujoco_lidar import MjLidarWrapper
 from jt128_scan_test import generate_jt128
@@ -61,6 +63,8 @@ class JT128Publisher(Node):
             "/mujoco/ground_truth",
             10,
         )
+        self.tf_broadcaster = TransformBroadcaster(self)
+
 
         # Map MuJoCo simulation time onto the current ROS clock.
         # Both LiDAR and IMU then use the same clock domain.
@@ -84,7 +88,7 @@ class JT128Publisher(Node):
         original_indices = np.nonzero(valid)[0]
         points = points[valid]
 
-        header = self._header(sim_time, "mimosa_lidar")
+        header = self._header(sim_time, "g1/lidar")
         header_ts = (
             float(header.stamp.sec)
             + float(header.stamp.nanosec) * 1e-9
@@ -163,14 +167,7 @@ class JT128Publisher(Node):
 
         self.publisher.publish(msg)
     def _stamp_from_sim_time(self, sim_time):
-        from builtin_interfaces.msg import Time
-
-        total_ns = self._ros_time_origin_ns + int(round(float(sim_time) * 1e9))
-
-        stamp = Time()
-        stamp.sec = total_ns // 1_000_000_000
-        stamp.nanosec = total_ns % 1_000_000_000
-        return stamp
+        return self.get_clock().now().to_msg()
 
     def _header(self, sim_time, frame_id):
         from std_msgs.msg import Header
@@ -204,8 +201,8 @@ class JT128Publisher(Node):
 
     def publish_ground_truth(self, model, data):
         msg = Odometry()
-        msg.header = self._header(data.time, "mujoco_world")
-        msg.child_frame_id = "mujoco_torso_imu"
+        msg.header = self._header(data.time, "world")
+        msg.child_frame_id = "g1/base_link"
 
         site_id = model.site("imu").id
         pos = data.site_xpos[site_id]
@@ -234,6 +231,47 @@ class JT128Publisher(Node):
         msg.twist.twist.angular.z = float(angvel[2])
 
         self.gt_publisher.publish(msg)
+
+        # Publish the same robot pose and timestamp as the odometry.
+        base_tf = TransformStamped()
+        base_tf.header = msg.header
+        base_tf.child_frame_id = msg.child_frame_id
+
+        base_tf.transform.translation.x = msg.pose.pose.position.x
+        base_tf.transform.translation.y = msg.pose.pose.position.y
+        base_tf.transform.translation.z = msg.pose.pose.position.z
+        base_tf.transform.rotation = msg.pose.pose.orientation
+
+        # Calculate the LiDAR pose relative to the pelvis IMU site.
+        base_rotation = data.site_xmat[site_id].reshape(3, 3)
+        lidar_site_id = model.site("lidar").id
+
+        lidar_position = base_rotation.T @ (
+            data.site_xpos[lidar_site_id] - pos
+        )
+        lidar_rotation = base_rotation.T @ (
+            data.site_xmat[lidar_site_id].reshape(3, 3)
+        )
+
+        lidar_quat = np.empty(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(lidar_quat, lidar_rotation.reshape(9))
+
+        lidar_tf = TransformStamped()
+        lidar_tf.header.stamp = msg.header.stamp
+        lidar_tf.header.frame_id = msg.child_frame_id
+        lidar_tf.child_frame_id = "g1/lidar"
+
+        lidar_tf.transform.translation.x = float(lidar_position[0])
+        lidar_tf.transform.translation.y = float(lidar_position[1])
+        lidar_tf.transform.translation.z = float(lidar_position[2])
+
+        # MuJoCo quaternion order is w, x, y, z.
+        lidar_tf.transform.rotation.w = float(lidar_quat[0])
+        lidar_tf.transform.rotation.x = float(lidar_quat[1])
+        lidar_tf.transform.rotation.y = float(lidar_quat[2])
+        lidar_tf.transform.rotation.z = float(lidar_quat[3])
+
+        self.tf_broadcaster.sendTransform([base_tf, lidar_tf])
 
 
 class OnnxController:
