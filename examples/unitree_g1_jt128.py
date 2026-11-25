@@ -179,11 +179,15 @@ class JT128Publisher(Node):
 
     def publish_imu(self, model, data):
         msg = Imu()
-        msg.header = self._header(data.time, "mimosa_imu")
+        msg.header = self._header(data.time, "g1/vn100_imu")
 
         # IMU sensors from the Unitree MuJoCo G1 model.
-        gyro = data.sensor("imu_gyro").data
-        accel = data.sensor("imu_acc").data
+        #gyro = data.sensor("imu_gyro").data
+        #accel = data.sensor("imu_acc").data
+
+        gyro = data.sensor("vn100_gyro").data
+        accel = data.sensor("vn100_acc").data
+        quat = data.sensor("vn100_quat").data  # MuJoCo order: w, x, y, z
 
         msg.angular_velocity.x = float(gyro[0])
         msg.angular_velocity.y = float(gyro[1])
@@ -195,7 +199,12 @@ class JT128Publisher(Node):
 
         # MIMOSA does not use sensor_msgs/Imu.orientation.
         # -1 indicates that orientation is not provided.
-        msg.orientation_covariance[0] = -1.0
+        #msg.orientation_covariance[0] = -1.0
+
+        msg.orientation.w = float(quat[0])
+        msg.orientation.x = float(quat[1])
+        msg.orientation.y = float(quat[2])
+        msg.orientation.z = float(quat[3])
 
         self.imu_publisher.publish(msg)
 
@@ -244,34 +253,37 @@ class JT128Publisher(Node):
 
         # Calculate the LiDAR pose relative to the pelvis IMU site.
         base_rotation = data.site_xmat[site_id].reshape(3, 3)
-        lidar_site_id = model.site("lidar").id
+        transforms = [base_tf]
 
-        lidar_position = base_rotation.T @ (
-            data.site_xpos[lidar_site_id] - pos
-        )
-        lidar_rotation = base_rotation.T @ (
-            data.site_xmat[lidar_site_id].reshape(3, 3)
-        )
+        for site_name in ("lidar", "vn100_imu"):
+            sensor_id = model.site(site_name).id
+            sensor_position = base_rotation.T @ (data.site_xpos[sensor_id] - pos)
+            sensor_rotation = (
+                base_rotation.T @ data.site_xmat[sensor_id].reshape(3, 3)
+            )
 
-        lidar_quat = np.empty(4, dtype=np.float64)
-        mujoco.mju_mat2Quat(lidar_quat, lidar_rotation.reshape(9))
+            quat = np.empty(4, dtype=np.float64)
+            mujoco.mju_mat2Quat(quat, sensor_rotation.reshape(9))
 
-        lidar_tf = TransformStamped()
-        lidar_tf.header.stamp = msg.header.stamp
-        lidar_tf.header.frame_id = msg.child_frame_id
-        lidar_tf.child_frame_id = "g1/lidar"
+            sensor_tf = TransformStamped()
+            sensor_tf.header.stamp = msg.header.stamp
+            sensor_tf.header.frame_id = msg.child_frame_id
+            sensor_tf.child_frame_id = f"g1/{site_name}"
 
-        lidar_tf.transform.translation.x = float(lidar_position[0])
-        lidar_tf.transform.translation.y = float(lidar_position[1])
-        lidar_tf.transform.translation.z = float(lidar_position[2])
+            translation = sensor_tf.transform.translation
+            translation.x = float(sensor_position[0])
+            translation.y = float(sensor_position[1])
+            translation.z = float(sensor_position[2])
 
-        # MuJoCo quaternion order is w, x, y, z.
-        lidar_tf.transform.rotation.w = float(lidar_quat[0])
-        lidar_tf.transform.rotation.x = float(lidar_quat[1])
-        lidar_tf.transform.rotation.y = float(lidar_quat[2])
-        lidar_tf.transform.rotation.z = float(lidar_quat[3])
+            rotation = sensor_tf.transform.rotation
+            rotation.w = float(quat[0])
+            rotation.x = float(quat[1])
+            rotation.y = float(quat[2])
+            rotation.z = float(quat[3])
 
-        self.tf_broadcaster.sendTransform([base_tf, lidar_tf])
+            transforms.append(sensor_tf)
+
+        self.tf_broadcaster.sendTransform(transforms)
 
 
 class OnnxController:
